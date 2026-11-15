@@ -33,7 +33,7 @@ const PROBE_TIMEOUT_MS = 8000;
 const UPSTREAM_TIMEOUT_MS = 30000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /** How many calls one provider is planned to take before the plan spills to the next model. */
-const PROVIDER_CAP = 8;
+const PROVIDER_CAP = 12;
 /** A same-wire candidate's advantage over a cross-wire one, in rating milli-points. */
 const WIRE_BONUS = 2;
 
@@ -778,7 +778,7 @@ function answerFromGeminiStream(text: string): Answer | null {
 }
 
 /** One provider call: the answer, or the refusal that sends the request on to another model. */
-async function callUpstream(candidate: Candidate, req: NormRequest): Promise<{ answer: Answer } | { refused: { status: number; code: string } }> {
+async function callUpstream(candidate: Candidate, req: NormRequest): Promise<{ answer: Answer } | { refused: { status: number; code: string; message: string } }> {
   const provider = candidate.provider;
   const model = candidate.model.id;
   const base = joinBase(provider.base);
@@ -804,21 +804,26 @@ async function callUpstream(candidate: Candidate, req: NormRequest): Promise<{ a
   try {
     res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
   } catch (err) {
-    return { refused: { status: 0, code: `unreachable: ${(err as Error).message}` } };
+    return { refused: { status: 0, code: `unreachable: ${(err as Error).message}`, message: (err as Error).message } };
   }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     let code = '';
+    let message = '';
     try {
       const parsed: unknown = JSON.parse(text);
       if (isObj(parsed)) {
-        if (isObj(parsed.error)) code = str(parsed.error.code) || str(parsed.error.type) || str(parsed.error.status);
+        if (isObj(parsed.error)) {
+          code = str(parsed.error.code) || str(parsed.error.type) || str(parsed.error.status);
+          message = str(parsed.error.message);
+        }
         if (code === '') code = str(parsed.code);
+        if (message === '') message = str(parsed.message);
       }
     } catch {
       // Not JSON: the HTTP status alone names the refusal.
     }
-    return { refused: { status: res.status, code } };
+    return { refused: { status: res.status, code, message: message || text.slice(0, 200) } };
   }
   const raw = await res.text();
   let answer: Answer | null;
@@ -829,11 +834,11 @@ async function callUpstream(candidate: Candidate, req: NormRequest): Promise<{ a
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return { refused: { status: 0, code: 'unreadable body' } };
+      return { refused: { status: 0, code: 'unreadable body', message: 'the provider answered a body this entry could not read' } };
     }
     answer = provider.wire === 'openai' ? answerFromOpenAI(parsed) : provider.wire === 'anthropic' ? answerFromAnthropic(parsed) : answerFromGemini(parsed);
   }
-  if (answer === null) return { refused: { status: 0, code: 'unreadable answer' } };
+  if (answer === null) return { refused: { status: 0, code: 'unreadable answer', message: 'the provider answered an answer this entry could not read' } };
   return { answer };
 }
 
@@ -1006,6 +1011,17 @@ function entryFor(api: 'openai' | 'anthropic', body: Dict): { id: string; requir
   return { id: `ad-hoc-${nextRequest}`, requires: requiresFromBody(api, body) };
 }
 
+/**
+ * Whether a refusal ends that provider for the rest of the trial rather than for one call: its free
+ * budget is spent, or it is out. The providers say which in their own error message, so a plan stops
+ * spending calls on a provider that cannot answer again, while a per-call refusal is simply retried
+ * elsewhere and the provider stays in play.
+ */
+function refusalEndsProvider(refused: { status: number; code: string; message: string }): boolean {
+  if (refused.status === 402) return true;
+  return /\bbudget is spent\b/i.test(refused.message) || /\bis out\b/i.test(refused.message);
+}
+
 /** Serve one client request: the planned candidates first, then the rest of the ranked list. */
 async function serve(api: 'openai' | 'anthropic', body: Dict, res: ServerResponse): Promise<void> {
   const entry = entryFor(api, body);
@@ -1023,8 +1039,8 @@ async function serve(api: 'openai' | 'anthropic', body: Dict, res: ServerRespons
     const result = await callUpstream(candidate, req);
     if ('refused' in result) {
       refused.push(`${key}: ${result.refused.status} ${result.refused.code}`);
-      if (result.refused.status === 402) spent.add(candidate.provider.id);
-      log(`refused ${key}: ${result.refused.status} ${result.refused.code}`);
+      if (refusalEndsProvider(result.refused)) spent.add(candidate.provider.id);
+      log(`refused ${key}: ${result.refused.status} ${result.refused.code} ${result.refused.message.slice(0, 80)}`);
       continue;
     }
     const answer = result.answer;
