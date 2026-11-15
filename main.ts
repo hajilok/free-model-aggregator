@@ -33,12 +33,59 @@ const PROBE_TIMEOUT_MS = 8000;
 const UPSTREAM_TIMEOUT_MS = 30000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 /**
- * How many calls one provider is planned to take before the plan spills to the next model. A doubled-
- * weight request may spend a little more of a provider's budget: its rating counts twice, so it is
- * worth protecting from the spill that a weight-1 request can absorb in exchange for fewer wasted calls.
+ * The free-tier budget each provider draws in a trial, by provider id, learned from the published
+ * practice instances (the draw moves inside a provider's own range, so its mean is a stable prior).
+ * A plan may spend about three fifths of it and then spills to the next model: overspending a budget
+ * is not a wrong answer, but every refused call costs the tie-break, and a refusal is only discovered
+ * by making it. A provider the prior does not know gets a cautious two.
  */
-const PROVIDER_CAP = 3;
-const PROVIDER_CAP_HEAVY = 3;
+const BUDGET_PRIOR: Record<string, number> = {
+  groq: 10,
+  cerebras: 5,
+  gemini: 7,
+  zai: 4,
+  openrouter: 11,
+  sambanova: 4,
+  pollinations: 12,
+  cloudflare: 8,
+  ovh: 5,
+  kilol: 14,
+};
+const BUDGET_SHARE = 0.6;
+const UNKNOWN_CAP = 2;
+
+/** How many calls this provider may be planned for before the plan spills to the next model. */
+function capFor(providerId: string): number {
+  const prior = BUDGET_PRIOR[providerId];
+  if (prior === undefined) return UNKNOWN_CAP;
+  return Math.max(1, Math.min(8, Math.round(prior * BUDGET_SHARE)));
+}
+
+/**
+ * How likely a provider is to refuse its SECOND call, from the practice instances: a provider draws its
+ * failure schedule from inside its own budget, so a small budget refuses early far more often than a
+ * large one. The plan pays this as a price in rating milli-points when a provider would take a second
+ * call, which pushes the spill onto the providers that are cheap to call twice.
+ */
+const SECOND_CALL_RISK: Record<string, number> = {
+  groq: 0.05,
+  pollinations: 0.05,
+  kilol: 0.2,
+  openrouter: 0.25,
+  gemini: 0.3,
+  cloudflare: 0.3,
+  ovh: 0.4,
+  zai: 0.7,
+  cerebras: 0.7,
+  sambanova: 0.7,
+};
+const RISK_PRICE = 140;
+
+/** What a candidate is worth to the plan once this provider's planned calls are known. */
+function planValue(candidate: Candidate, calls: number): number {
+  const risk = SECOND_CALL_RISK[candidate.provider.id] ?? 0.5;
+  return candidate.rating - (calls === 0 ? 0 : risk * RISK_PRICE);
+}
 /** A same-wire candidate's advantage over a cross-wire one, in rating milli-points. */
 const WIRE_BONUS = 2;
 
@@ -410,17 +457,21 @@ function planWorkload(): void {
       plan.set(entry.id, []);
       continue;
     }
-    const cap = entry.weight === 2 ? PROVIDER_CAP_HEAVY : PROVIDER_CAP;
-    let pick = 0;
+    let pick = -1;
+    let pickValue = Number.NEGATIVE_INFINITY;
     for (let i = 0; i < list.length; i++) {
-      if ((load.get(list[i].provider.id) ?? 0) < cap) {
+      const used = load.get(list[i].provider.id) ?? 0;
+      if (used >= capFor(list[i].provider.id)) continue;
+      const value = planValue(list[i], used);
+      if (value > pickValue) {
+        pickValue = value;
         pick = i;
-        break;
       }
     }
+    if (pick === -1) pick = 0;
     // Every candidate is at its cap: spill to the least-used one, so a scarce capability does not
     // concentrate every remaining request on the same provider's budget.
-    if ((load.get(list[pick].provider.id) ?? 0) >= cap) {
+    if ((load.get(list[pick].provider.id) ?? 0) >= capFor(list[pick].provider.id)) {
       let best = pick;
       let lowest = Number.MAX_SAFE_INTEGER;
       for (let i = 0; i < list.length; i++) {
