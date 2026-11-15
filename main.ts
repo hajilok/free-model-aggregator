@@ -32,8 +32,13 @@ const POLL_MS = 100;
 const PROBE_TIMEOUT_MS = 8000;
 const UPSTREAM_TIMEOUT_MS = 30000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-/** How many calls one provider is planned to take before the plan spills to the next model. */
-const PROVIDER_CAP = 12;
+/**
+ * How many calls one provider is planned to take before the plan spills to the next model. A doubled-
+ * weight request may spend a little more of a provider's budget: its rating counts twice, so it is
+ * worth protecting from the spill that a weight-1 request can absorb in exchange for fewer wasted calls.
+ */
+const PROVIDER_CAP = 3;
+const PROVIDER_CAP_HEAVY = 3;
 /** A same-wire candidate's advantage over a cross-wire one, in rating milli-points. */
 const WIRE_BONUS = 2;
 
@@ -405,12 +410,27 @@ function planWorkload(): void {
       plan.set(entry.id, []);
       continue;
     }
+    const cap = entry.weight === 2 ? PROVIDER_CAP_HEAVY : PROVIDER_CAP;
     let pick = 0;
     for (let i = 0; i < list.length; i++) {
-      if ((load.get(list[i].provider.id) ?? 0) < PROVIDER_CAP) {
+      if ((load.get(list[i].provider.id) ?? 0) < cap) {
         pick = i;
         break;
       }
+    }
+    // Every candidate is at its cap: spill to the least-used one, so a scarce capability does not
+    // concentrate every remaining request on the same provider's budget.
+    if ((load.get(list[pick].provider.id) ?? 0) >= cap) {
+      let best = pick;
+      let lowest = Number.MAX_SAFE_INTEGER;
+      for (let i = 0; i < list.length; i++) {
+        const used = load.get(list[i].provider.id) ?? 0;
+        if (used < lowest) {
+          lowest = used;
+          best = i;
+        }
+      }
+      pick = best;
     }
     const chosen = list[pick];
     load.set(chosen.provider.id, (load.get(chosen.provider.id) ?? 0) + 1);
